@@ -7,6 +7,8 @@ import json
 import time
 from pathlib import Path
 from jsonpath_ng import parse
+from requests.exceptions import RequestException
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -25,22 +27,11 @@ logger.addHandler(f_handler)
 
 address = 'https://lubimyczytac.pl/'
 file_path = Path('ebook.xlsx')
-try:
-    wb = openpyxl.load_workbook(file_path)
-    sheet = wb.active
-except IOError:
-    logger.info('The file is missing, a new one was created.')
-    wb = openpyxl.Workbook()
-    sheet = wb.active
-    sheet.append(
-        ["Author", "Title", "Folder", "Rating", "Votes", "Category", "Date of the first edition", "Date of the "
-                                                                                                  "first PL "
-                                                                                                  "edition",
-         "Pages No", "Tags", "Description"])
-    wb.save('ebook.xlsx')
+wb = openpyxl.load_workbook(file_path)
+sheet = wb.active
 
 
-def main():
+def main(row_from, row_to):
     logger.info('Getting Started...\n')
 
     lc_headers = {'X-Csrf-Token': 'b42ee05dc19f593fb108c70c11a17e22', 'X-Requested-With': 'XMLHttpRequest'}
@@ -50,90 +41,85 @@ def main():
         title = sheet.cell(row=i + 1, column=2)
         author = sheet.cell(row=i + 1, column=1).value
         surname = author.split(' ', 1)[1] if author.find(' ') > 0 else author
-        logger.info('Search item: %s, %s.', title.value, surname)
+        logger.info(f'Search item: {surname} - {title.value}.')
         uri1 = urllib.parse.quote(title.value + ' ' + surname)
         uri2 = urllib.parse.quote(title.value)
 
-        url = 'https://lubimyczytac.pl/searcher/getsuggestions?phrase=' + uri1
-        url2 = 'https://lubimyczytac.pl/searcher/getsuggestions?phrase=' + uri2
+        url = f'https://lubimyczytac.pl/searcher/getsuggestions?phrase={uri1}'
+        url2 = f'https://lubimyczytac.pl/searcher/getsuggestions?phrase={uri2}'
 
         def book_url(url):
-            content = requests.get(url, headers=lc_headers).text
-            soup = BeautifulSoup(content, 'html.parser')
-            json_text = soup.get_text()
-            json_data = json.loads(json_text)
-            jsonpath_expression = parse('$.items.books.results[0].url')
-            match = jsonpath_expression.find(json_data)
-            return match
+            try:
+                content = requests.get(url, headers=lc_headers).text
+                soup = BeautifulSoup(content, 'html.parser')
+                json_text = soup.get_text()
+                json_data = json.loads(json_text)
+                jsonpath_expression = parse('$.items.books.results[0].url')
+                match = jsonpath_expression.find(json_data)
+                return match
+            except RequestException as e:
+                logger.warning(f'Request error: {str(e)}')
+                return None
 
         try:
-            try:
-                book_match = book_url(url)
-                title_url = book_match[0].value
-                logger.info('Loading the website %s.', title_url)
-            except:
-                book_match = book_url(url2)
-                title_url = book_match[0].value
-                logger.info('Loading the website %s.', title_url)
+            book_match = book_url(url)
+            title_url = book_match[0].value
+            logger.info(f'Loading the website {title_url}.')
         except:
-            logger.warning('Item not found!')
-            missing_items.append(title.value + ' - ' + author)
-            counter += 1
-            continue
+            book_match = book_url(url2)
+            if book_match is None or len(book_match) == 0:
+                logger.warning(f'No book {title.value} found.')
+                missing_items.append(title.value)
+                counter += 1
+                continue
+            title_url = book_match[0].value
+            logger.info(f'Loading the website {title_url}.')
 
         content2 = requests.get(title_url).text
         soup = BeautifulSoup(content2, 'html.parser')
         description = soup.find("div", {"class": "collapse-content"}).find('p')
+        logger.info(f'Row {i}. {title.value} - saving the following data:')
 
-        rate = soup.find(class_="big-number").get_text()
-        sheet.cell(row=i + 1, column=4).value = rate[1:]
+        rate = soup.find('span', {'class': 'big-number'}).text.strip()
+        rate = rate.replace(',', '.')
+        sheet.cell(row=i + 1, column=4).value = float(rate)
+        sheet.cell(row=i + 1, column=4).number_format = '#,##0.00'
 
-        raters_no = soup.find(class_="d-none d-lg-block book-on-shelfs__rating--1").get_text()
-        detail_list = raters_no.split(' \n\n')
-
-        logger.info('%s. %s - saving the following data:', i, title.value)
-
-        voters = (detail_list[2].replace("\n", "")).split(' ')[0] if len(detail_list) > 2 else 0
-        logger.info('   - %s;', voters)
-        try:
+        voters = soup.find('a', class_='btn-link').text.strip().split()[0]
+        if voters.isdigit():
             sheet.cell(row=i + 1, column=5).value = int(voters)
-        except:
+        else:
             sheet.cell(row=i + 1, column=5).value = voters
+        logger.info(f'   - rating {rate}, {voters} votes;')
 
-        logger.info('   - %s;', soup.find(class_='book__category d-sm-block d-none').get_text()[1:])
-        sheet.cell(row=i + 1, column=6).value = soup.find(class_='book__category d-sm-block d-none').get_text()[1:]
+        date_of_edition_soup = soup.select_one('dt:-soup-contains("Data wydania:")')
+        date_of_edition = date_of_edition_soup.find_next_sibling('dd').text.strip() if date_of_edition_soup else ""
+        sheet.cell(row=i + 1, column=8).value = date_of_edition
 
-        description_text = description.get_text().replace('\n', '') if description is not None else 'Brak opisu.'
-        logger.info('   - %s(...);', description_text[:50])
+        date_of_1edition_soup = soup.select_one('dt:-soup-contains("Data 1. wydania:")')
+        date_of_1edition = date_of_1edition_soup.find_next_sibling('dd').text.strip() if date_of_1edition_soup else ""
+        sheet.cell(row=i + 1, column=7).value = date_of_1edition
+
+        pages_no_soup = soup.select_one('dt:-soup-contains("Liczba stron:")')
+        pages_no = pages_no_soup.find_next_sibling('dd').text.strip() if pages_no_soup else ""
+        sheet.cell(row=i + 1, column=9).value = int(pages_no) if pages_no else ""
+
+        category_soup = soup.select_one('dt:-soup-contains("Kategoria:")')
+        category = category_soup.find_next_sibling('dd').text.strip() if category_soup else ""
+        sheet.cell(row=i + 1, column=6).value = category
+        logger.info(f'   - category {category};')
+
+        tags_soup = soup.select_one('dt:-soup-contains("Tagi:")')
+        tags = ", ".join(
+            [tag.text.strip() for tag in tags_soup.find_next_sibling('dd').find_all('a')]) if tags_soup else ""
+        sheet.cell(row=i + 1, column=10).value = tags
+
+        description_text = description.get_text().replace('\n', '').strip() if description is not None else 'Brak opisu.'
         sheet.cell(row=i + 1, column=11).value = description_text
+        logger.info(f"   - {description_text.split('.')[0][:100]};")
 
-        details = soup.find(id="book-details").get_text()
-        row_details = soup.find(id="book-details")
+        logger.info(f'Completed {round((i - row_from + 1) * 100 / (row_to - row_from))}%.\n')
 
-        keys = row_details.find_all('dt')
-        values = row_details.find_all('dd')
-
-        details_dict = {}
-        for key in keys:
-            for value in values:
-                details_dict[key.get_text().replace('\n', '')] = value.get_text().replace('\n', '')
-                values.remove(value)
-                break
-
-        def cell_filler(tag, column_no, convert_type='str'):
-            if tag in details_dict:
-                logger.info('   - %s;', details_dict[tag].replace('\n', ''))
-                sheet.cell(row=i + 1, column=column_no).value = details_dict[tag].replace('\n',
-                                                                                          '') if convert_type == 'str' else int(
-                    details_dict[tag].replace('\n', ''))
-            else:
-                sheet.cell(row=i + 1, column=column_no).value = ""
-
-        cell_filler('Data 1. wydania:', 7)
-        cell_filler('Data 1. wyd. pol.:', 8)
-        cell_filler('Liczba stron:', 9, 'int')
-        cell_filler('Tagi:', 10)
-        logger.info('Completed %s percent.\n', round((i - row_from + 1) * 100 / (row_to - row_from)))
         i = 0
         while i < 3:
             try:
@@ -141,37 +127,75 @@ def main():
                 break
             except PermissionError:
                 i += 1
-                print(f"You Don't Have Permission to Access the File, retry in 15 sec.")
-                time.sleep(15)
+                remaining_time = 15
+                logger.warning("You don't have permission to access the file.")
+                while remaining_time > 0:
+                    logger.warning("Retry in %d sec.", remaining_time)
+                    time.sleep(1)
+                    remaining_time -= 1
 
-    if (counter - 1) == 0:
-        logger.info('All %s items have been found!', (row_to - row_from))
+    if counter == 1:
+        logger.info(f'All {row_to - row_from} items have been found!')
+    elif missing_items:
+        logger.info(f'The following items were not found ({counter - 1} of {row_to - row_from}): \n - {chr(10).join(missing_items)};')
     else:
-        logger.info('The following items were not found (%s of %s): %s', counter - 1, (row_to - row_from), missing_items)
+        logger.info(f'All {row_to - row_from} items have been found, but some have missing data.')
+
+
+def file_check():
+    if file_path.exists():
+        main()
+    else:
+        filename = 'ebook.xlsx'
+        wb = openpyxl.Workbook()
+        wb.save(filename)
+        main()
+
+
+def option_1():
+    print(f'In the active sheet {sheet.title} I write the information for {sheet.max_row - sheet.min_row} items.')
+    row_from = int(sheet.min_row)
+    row_to = int(sheet.max_row)
+    main(row_from, row_to)
+
+
+def option_2():
+    print(f'The active sheet {sheet.title} has rows {sheet.min_row} through {sheet.max_row} filled in.')
+    row_from = int(input('Row from: '))
+    row_to = int(input('Row to: '))
+    main(row_from, row_to)
+
+
+def option_3():
+    print(f'There are {sheet.max_row - sheet.min_row} items in the active sheet {sheet.title} (rows {sheet.min_row} to {sheet.max_row}).')
+    print(f'The other sheets: {wb.sheetnames}')
+
+
+def option_4():
+    return True
+
+
+options = {
+    "1": option_1,
+    "2": option_2,
+    "3": option_3,
+    "4": option_4
+}
 
 while True:
-    print("...::: MENU :::...")
-    print("1. Find all items")
-    print("2. Find selected items")
-    print("3. Info")
-    print("4. Exit")
+    print("+----------------------------------+")
+    print("|        ...::: MENU :::...        |")
+    print("+----------------------------------+")
+    print("| 1. Find all items                |")
+    print("| 2. Find selected items           |")
+    print("| 3. Info                          |")
+    print("| 4. Exit                          |")
+    print("+----------------------------------+")
 
     option = input("Select an option: ")
 
-    if option == "1":
-        print(f'In the active sheet {sheet.title} I write the information for {sheet.max_row - sheet.min_row} items.')
-        row_from = int(sheet.min_row)
-        row_to = int(sheet.max_row)
-        main()
-    elif option == "2":
-        print(f'The active sheet {sheet.title} has rows {sheet.min_row} through {sheet.max_row} filled in.')
-        row_from = int(input('Row from: '))
-        row_to = int(input('Row to: '))
-        main()
-    elif option == "3":
-        print(f'There are {sheet.max_row - sheet.min_row} items in the active sheet {sheet.title} (rows {sheet.min_row} to {sheet.max_row}).')
-        print(f'The other sheets: {wb.sheetnames}')
-    elif option == "4":
-        break
+    if option in options:
+        if options[option]():
+            break
     else:
         print("Incorrect entry, try again!")
